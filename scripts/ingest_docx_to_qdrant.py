@@ -5,26 +5,28 @@ from __future__ import annotations
 
 import argparse
 import sys
-import uuid
 from pathlib import Path
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 from ChunkExtractor.chunk_extractor import ChunkExtractor
 from FisReader.document_factory import DocumentFactory
+from qdrant_config import (
+    ROOT,
+    add_qdrant_args,
+    get_collection_name,
+    get_qdrant_url,
+    make_qdrant_client,
+)
+from qdrant_ingest import ensure_collection, get_ingested_doc_ids, make_point_id, resolve_device
 
-ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DOCX_DIR = ROOT / "VbplCrawler" / "output" / "doanh-nghiep-docx"
 DEFAULT_MODEL_PATH = ROOT / "models" / "Vietnamese_Embedding_v2"
-DEFAULT_QDRANT_URL = "http://localhost:6333"
-DEFAULT_COLLECTION = "legal_documents"
-VECTOR_SIZE = 1024
-
-
-def make_point_id(doc_id: str, chunk_id: int) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{doc_id}:{chunk_id}"))
 
 
 def extract_doc_id(file_path: Path) -> str:
@@ -36,6 +38,7 @@ def extract_doc_id(file_path: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest DOCX files into Qdrant")
+    add_qdrant_args(parser)
     parser.add_argument(
         "--docx-dir",
         type=Path,
@@ -47,16 +50,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_MODEL_PATH,
         help="Path to Vietnamese_Embedding_v2 model",
-    )
-    parser.add_argument(
-        "--qdrant-url",
-        default=DEFAULT_QDRANT_URL,
-        help="Qdrant server URL",
-    )
-    parser.add_argument(
-        "--collection",
-        default=DEFAULT_COLLECTION,
-        help="Qdrant collection name",
     )
     parser.add_argument(
         "--batch-size",
@@ -88,53 +81,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_ingested_doc_ids(client: QdrantClient, collection: str) -> set[str]:
-    if not client.collection_exists(collection):
-        return set()
-    doc_ids: set[str] = set()
-    offset = None
-    while True:
-        points, offset = client.scroll(
-            collection_name=collection,
-            limit=256,
-            offset=offset,
-            with_payload=["doc_id"],
-            with_vectors=False,
-        )
-        for point in points:
-            if point.payload and point.payload.get("doc_id"):
-                doc_ids.add(str(point.payload["doc_id"]))
-        if offset is None:
-            break
-    return doc_ids
-
-
-def resolve_device(device: str) -> str | None:
-    if device == "auto":
-        try:
-            import torch
-
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            return "cpu"
-    return device if device else None
-
-
-def ensure_collection(client: QdrantClient, collection: str, recreate: bool) -> None:
-    if recreate and client.collection_exists(collection):
-        client.delete_collection(collection)
-        print(f"Đã xóa collection: {collection}")
-
-    if not client.collection_exists(collection):
-        client.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-        )
-        print(f"Đã tạo collection: {collection}")
-    else:
-        print(f"Collection '{collection}' đã tồn tại — upsert thêm dữ liệu")
-
-
 def main() -> int:
     args = parse_args()
 
@@ -152,11 +98,12 @@ def main() -> int:
         print(f"Không tìm thấy file .docx trong {args.docx_dir}", file=sys.stderr)
         return 1
 
-    client = QdrantClient(url=args.qdrant_url)
-    ensure_collection(client, args.collection, args.recreate)
+    collection = get_collection_name(args.collection)
+    client = make_qdrant_client(args.qdrant_url, args.qdrant_api_key)
+    ensure_collection(client, collection, args.recreate)
 
     if args.skip_ingested:
-        ingested = get_ingested_doc_ids(client, args.collection)
+        ingested = get_ingested_doc_ids(client, collection)
         before = len(docx_files)
         docx_files = [f for f in docx_files if extract_doc_id(f) not in ingested]
         print(f"Bỏ qua {before - len(docx_files)} file đã ingest, còn {len(docx_files)} file")
@@ -169,7 +116,7 @@ def main() -> int:
     print(f"Tìm thấy {len(docx_files)} file docx")
     print(f"Model: {args.model_path}")
     print(f"Device: {device or 'default'} | batch_size={args.batch_size}")
-    print(f"Qdrant: {args.qdrant_url} / collection={args.collection}")
+    print(f"Qdrant: {get_qdrant_url(args.qdrant_url)} / collection={collection}")
 
     model_kwargs = {}
     if device:
@@ -232,18 +179,19 @@ def main() -> int:
                             "law_code": chunk["law_code"],
                             "article_number": chunk["article_number"],
                             "text": chunk["text"],
+                            "source": "docx",
                         },
                     )
                 )
 
-        client.upsert(collection_name=args.collection, points=points)
+        client.upsert(collection_name=collection, points=points)
         total_chunks += len(chunks)
         print(f"  → {len(chunks)} chunks upserted")
 
-    info = client.get_collection(args.collection)
+    info = client.get_collection(collection)
     print()
     print(f"Hoàn tất: {total_chunks} chunks từ {len(docx_files) - len(failed)}/{len(docx_files)} file")
-    print(f"Qdrant collection '{args.collection}': {info.points_count} points")
+    print(f"Qdrant collection '{collection}': {info.points_count} points")
     if failed:
         print(f"Lỗi ({len(failed)} file):")
         for name, err in failed[:10]:

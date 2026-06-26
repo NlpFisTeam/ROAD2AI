@@ -10,6 +10,8 @@ from typing import Any
 from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
 
+from qdrant_config import normalize_chunk_payload
+
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
@@ -26,7 +28,7 @@ def chunk_key(payload: dict[str, Any]) -> str:
 
 
 def payload_from_qdrant(point) -> dict[str, Any]:
-    payload = dict(point.payload or {})
+    payload = normalize_chunk_payload(point.payload or {})
     payload["point_id"] = str(point.id)
     return payload
 
@@ -122,6 +124,9 @@ def chunk_record(
         "dense_score": dense_score,
         "bm25_score": bm25_score,
         "rerank_score": rerank_score,
+        "point_id": str(payload.get("point_id", "")),
+        "doc_id": str(payload.get("doc_id", "")),
+        "chunk_id": str(payload.get("chunk_id", "")),
         "law_type": payload.get("law_type", ""),
         "law_code": payload.get("law_code", ""),
         "law_title": payload.get("law_title", ""),
@@ -131,38 +136,110 @@ def chunk_record(
     }
 
 
+def chunk_key_from_record(chunk: dict[str, Any]) -> str:
+    doc_id = str(chunk.get("doc_id", ""))
+    chunk_id = str(chunk.get("chunk_id", ""))
+    if doc_id or chunk_id:
+        return f"{doc_id}:{chunk_id}"
+    point_id = str(chunk.get("point_id", ""))
+    if point_id:
+        return point_id
+    return f"{chunk.get('law_code', '')}:{chunk.get('file_name', '')}:{chunk.get('article_number', '')}"
+
+
+def merge_hybrid_results(
+    chunk_lists: list[list[dict[str, Any]]],
+    *,
+    rrf_k: int = 60,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """RRF-merge multiple hybrid retrieval result lists into one ranked list."""
+    if not chunk_lists:
+        return []
+    if len(chunk_lists) == 1:
+        return chunk_lists[0][:top_k]
+
+    ranked_lists: list[list[tuple[str, float | None]]] = []
+    chunk_by_key: dict[str, dict[str, Any]] = {}
+
+    for chunks in chunk_lists:
+        ranked: list[tuple[str, float | None]] = []
+        for chunk in chunks:
+            key = chunk_key_from_record(chunk)
+            chunk_by_key[key] = chunk
+            ranked.append((key, chunk.get("score")))
+        if ranked:
+            ranked_lists.append(ranked)
+
+    if not ranked_lists:
+        return []
+
+    fused = reciprocal_rank_fusion(ranked_lists, rrf_k=rrf_k)[:top_k]
+    merged: list[dict[str, Any]] = []
+    for rank, (key, fused_score) in enumerate(fused, start=1):
+        source = chunk_by_key[key]
+        merged.append(
+            chunk_record(
+                source,
+                rank=rank,
+                score=fused_score,
+                dense_score=source.get("dense_score"),
+                bm25_score=source.get("bm25_score"),
+                rerank_score=source.get("rerank_score"),
+            )
+        )
+    return merged
+
+
 def hybrid_retrieve_one(
     query: str,
     *,
     dense_hits: list,
-    bm25: BM25Okapi,
-    corpus: list[dict[str, Any]],
     top_k: int,
     pool_size: int,
     rrf_k: int,
+    bm25: BM25Okapi | None = None,
+    corpus: list[dict[str, Any]] | None = None,
+    sparse_hits: list | None = None,
 ) -> list[dict[str, Any]]:
     dense_ranked: list[tuple[str, float | None]] = []
     payload_by_key: dict[str, dict[str, Any]] = {}
     dense_score_by_key: dict[str, float] = {}
 
     for hit in dense_hits[:pool_size]:
-        payload = dict(hit.payload or {})
+        payload = normalize_chunk_payload(hit.payload or {})
         payload["point_id"] = str(hit.id)
         key = chunk_key(payload)
         payload_by_key[key] = payload
         dense_score_by_key[key] = float(hit.score)
         dense_ranked.append((key, hit.score))
 
-    bm25_hits = bm25_top_k(bm25, corpus, query, pool_size)
     bm25_ranked: list[tuple[str, float | None]] = []
     bm25_score_by_key: dict[str, float] = {}
-    for payload, score in bm25_hits:
-        key = chunk_key(payload)
-        payload_by_key[key] = payload
-        bm25_score_by_key[key] = score
-        bm25_ranked.append((key, score))
 
-    fused = reciprocal_rank_fusion([dense_ranked, bm25_ranked], rrf_k=rrf_k)[:top_k]
+    if sparse_hits is not None:
+        for hit in sparse_hits[:pool_size]:
+            payload = normalize_chunk_payload(hit.payload or {})
+            payload["point_id"] = str(hit.id)
+            key = chunk_key(payload)
+            payload_by_key[key] = payload
+            score = float(hit.score)
+            bm25_score_by_key[key] = score
+            bm25_ranked.append((key, score))
+    elif bm25 is not None and corpus is not None:
+        bm25_hits = bm25_top_k(bm25, corpus, query, pool_size)
+        for payload, score in bm25_hits:
+            key = chunk_key(payload)
+            payload_by_key[key] = payload
+            bm25_score_by_key[key] = score
+            bm25_ranked.append((key, score))
+    else:
+        raise ValueError("Cần sparse_hits (Qdrant BM25) hoặc bm25+corpus (local index)")
+
+    ranked_lists = [dense_ranked]
+    if bm25_ranked:
+        ranked_lists.append(bm25_ranked)
+    fused = reciprocal_rank_fusion(ranked_lists, rrf_k=rrf_k)[:top_k]
 
     chunks: list[dict[str, Any]] = []
     for rank, (key, fused_score) in enumerate(fused, start=1):

@@ -6,3 +6,13 @@ qdrant_storage/
 *.npz
 *.pt
 *.pth
+models/
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+.env.cloud

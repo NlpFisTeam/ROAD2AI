@@ -7,6 +7,8 @@ from typing import Any
 
 from sentence_transformers import CrossEncoder
 
+from qdrant_config import normalize_chunk_payload
+
 MAX_RERANK_LENGTH = 2304
 
 
@@ -17,7 +19,8 @@ def load_reranker(model_path: str | Path, device: str = "cuda") -> CrossEncoder:
 def dense_hits_to_chunks(hits) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     for rank, hit in enumerate(hits, start=1):
-        payload = hit.payload or {}
+        payload = normalize_chunk_payload(hit.payload or {})
+        payload["point_id"] = str(hit.id)
         chunks.append(
             {
                 "rank": rank,
@@ -26,6 +29,9 @@ def dense_hits_to_chunks(hits) -> list[dict[str, Any]]:
                 "dense_score": float(hit.score),
                 "bm25_score": None,
                 "rerank_score": None,
+                "point_id": str(hit.id),
+                "doc_id": str(payload.get("doc_id", "")),
+                "chunk_id": str(payload.get("chunk_id", "")),
                 "law_type": payload.get("law_type", ""),
                 "law_code": payload.get("law_code", ""),
                 "law_title": payload.get("law_title", ""),

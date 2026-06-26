@@ -3,3 +3,6 @@ sentence-transformers
 transformers
 torch
 rank-bm25
+python-dotenv
+pandas
+pyarrow

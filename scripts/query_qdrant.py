@@ -7,10 +7,19 @@ import argparse
 import sys
 from pathlib import Path
 
-from qdrant_client import QdrantClient
+from qdrant_config import (
+    ROOT,
+    add_qdrant_args,
+    get_collection_name,
+    get_embed_model_path,
+    get_sparse_vector_name,
+    init_qdrant_from_args,
+    make_qdrant_client,
+    query_dense,
+    query_sparse_bm25,
+)
 from sentence_transformers import SentenceTransformer
 
-ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -22,13 +31,13 @@ from rerank_retrieval import dense_hits_to_chunks, load_reranker, rerank_chunks
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("query", help="Search query in Vietnamese")
-    parser.add_argument("--collection", default="legal_documents")
-    parser.add_argument("--qdrant-url", default="http://localhost:6333")
+    add_qdrant_args(parser)
     parser.add_argument("--limit", type=int, default=30, help="Final chunks after rerank")
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=ROOT / "models" / "Vietnamese_Embedding_v2",
+        default=None,
+        help="Embedding model path (default: EMBED_MODEL_PATH or ROAD2AI/models/Vietnamese_Embedding)",
     )
     parser.add_argument(
         "--use-bm25",
@@ -52,34 +61,54 @@ def main() -> None:
     parser.add_argument("--rerank-batch", type=int, default=32)
     parser.add_argument("--no-rerank", action="store_true")
     args = parser.parse_args()
+    init_qdrant_from_args(args)
+    collection = get_collection_name(args.collection)
 
-    client = QdrantClient(url=args.qdrant_url)
+    client = make_qdrant_client(args.qdrant_url, args.qdrant_api_key)
     pool_size = args.retrieve_pool
     use_rerank = not args.no_rerank
     fusion_top_k = args.rrf_top_k if (args.use_bm25 and use_rerank) else args.limit
     ann_limit = pool_size if (args.use_bm25 or use_rerank) else args.limit
 
-    model = SentenceTransformer(str(args.model_path))
+    model_path = get_embed_model_path(args.model_path)
+    model = SentenceTransformer(str(model_path))
     model.max_seq_length = 2048
     vector = model.encode([args.query], normalize_embeddings=True)[0].tolist()
-    hits = client.query_points(
-        collection_name=args.collection,
-        query=vector,
+    hits = query_dense(
+        client,
+        collection,
+        vector,
         limit=ann_limit,
+        vector_name=args.vector_name,
     )
 
     if args.use_bm25:
-        bm25, corpus = load_or_build_bm25_index(client, args.collection, args.bm25_cache)
+        sparse_name = get_sparse_vector_name(getattr(args, "sparse_vector_name", None))
+        sparse_hits = None
+        bm25 = corpus = None
+        if sparse_name:
+            sparse_res = query_sparse_bm25(
+                client,
+                collection,
+                args.query,
+                limit=pool_size,
+                sparse_vector_name=sparse_name,
+            )
+            sparse_hits = sparse_res.points
+            mode = f"hybrid (Qdrant {sparse_name})"
+        else:
+            bm25, corpus = load_or_build_bm25_index(client, collection, args.bm25_cache)
+            mode = "hybrid (local BM25)"
         chunks = hybrid_retrieve_one(
             args.query,
             dense_hits=hits.points,
             bm25=bm25,
             corpus=corpus,
+            sparse_hits=sparse_hits,
             top_k=fusion_top_k,
             pool_size=pool_size,
             rrf_k=args.rrf_k,
         )
-        mode = "hybrid"
     else:
         chunks = dense_hits_to_chunks(hits.points)
         mode = "dense"
